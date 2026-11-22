@@ -7,6 +7,56 @@ final class APIExportClientTests: XCTestCase {
     // observation state that can crash during test-process teardown on macOS 26.
     private static var retainedSettings: [AdvancedExportSettings] = []
 
+    func testMembershipContinuationResendsExactPreparedBytes() async throws {
+        let body = Data(repeating: 32, count: 18_000)
+        var requests: [URLRequest] = []
+        let session = membershipSession { request in
+            requests.append(request)
+            return requests.count == 1
+                ? (503, "{\"status\":\"capture_membership_pending\",\"export_id\":\"fixture-export\",\"next_cursor\":8192,\"total\":9000,\"retry_same_original\":true}")
+                : (200, "{\"status\":\"accepted\"}")
+        }
+        defer { session.invalidateAndCancel() }
+        var request = URLRequest(url: URL(string: "https://fixture.invalid/healthmd")!)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("Bearer fabricated-token", forHTTPHeaderField: "Authorization")
+        let result = try await APIExportClient(session: session).uploadPreparedRequest(request)
+        XCTAssertEqual(result.statusCode, 200)
+        XCTAssertEqual(requests.count, 2)
+        for sent in requests {
+            XCTAssertEqual(sent.httpBody, body)
+            XCTAssertEqual(sent.url, request.url)
+            XCTAssertEqual(sent.value(forHTTPHeaderField: "Authorization"), "Bearer fabricated-token")
+        }
+    }
+
+    func testStalledMembershipProgressStopsWithoutRebuildingTheExport() async throws {
+        var calls = 0
+        let session = membershipSession { _ in
+            calls += 1
+            return (503, "{\"status\":\"capture_membership_pending\",\"export_id\":\"fixture-export\",\"next_cursor\":8192,\"total\":9000,\"retry_same_original\":true}")
+        }
+        defer { session.invalidateAndCancel() }
+        var request = URLRequest(url: URL(string: "https://fixture.invalid/healthmd")!)
+        request.httpMethod = "POST"
+        request.httpBody = Data(repeating: 32, count: 18_000)
+        do {
+            _ = try await APIExportClient(session: session).uploadPreparedRequest(request)
+            XCTFail("A repeated cursor must remain a failed export")
+        } catch APIExportClientError.serverRejected(let status, _) {
+            XCTAssertEqual(status, 503)
+        }
+        XCTAssertEqual(calls, 2)
+    }
+
+    private func membershipSession(_ handler: @escaping (URLRequest) -> (Int, String)) -> URLSession {
+        HealthAPIMembershipURLProtocol.handler = handler
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HealthAPIMembershipURLProtocol.self]
+        return URLSession(configuration: configuration)
+    }
+
     func testWHOOPSidecarsUseAPIEnvelopeV2AndAreRedacted() throws {
         let date = Self.day(2026, 7, 13)
         var healthData = HealthData(date: date)
@@ -125,4 +175,19 @@ final class APIExportClientTests: XCTestCase {
     private static func day(_ year: Int, _ month: Int, _ day: Int) -> Date {
         Calendar.current.date(from: DateComponents(year: year, month: month, day: day, hour: 12))!
     }
+}
+
+private final class HealthAPIMembershipURLProtocol: URLProtocol {
+    static var handler: ((URLRequest) -> (Int, String))?
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let (status, body) = Self.handler!(request)
+        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil,
+            headerFields: ["Content-Type": "application/json", "Retry-After": "0"])!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
 }

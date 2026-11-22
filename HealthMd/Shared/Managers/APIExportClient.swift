@@ -68,23 +68,54 @@ struct APIExportClient {
         }
         request.httpBody = body
 
-        let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw APIExportClientError.invalidResponse
-        }
+        return try await uploadPreparedRequest(request)
+    }
 
-        let responsePreview = Self.responsePreview(from: data)
-        guard (200..<300).contains(httpResponse.statusCode) else {
-            throw APIExportClientError.serverRejected(
-                statusCode: httpResponse.statusCode,
-                body: responsePreview
-            )
+    /// A receiver may durably inventory a large export over several requests.
+    /// Continue only that explicit progress protocol, reusing this exact body,
+    /// timestamp, destination and authorization; a rebuilt export is a new job.
+    func uploadPreparedRequest(_ request: URLRequest) async throws -> APIExportUploadResult {
+        var previous: MembershipProgress?
+        while true {
+            try Task.checkCancellation()
+            let (data, response) = try await session.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw APIExportClientError.invalidResponse
+            }
+            let preview = Self.responsePreview(from: data)
+            if (200..<300).contains(httpResponse.statusCode) {
+                return APIExportUploadResult(statusCode: httpResponse.statusCode, responseBodyPreview: preview)
+            }
+            guard httpResponse.statusCode == 503,
+                  let progress = try? JSONDecoder().decode(MembershipProgress.self, from: data),
+                  progress.status == "capture_membership_pending", progress.retrySameOriginal,
+                  !progress.exportID.isEmpty, progress.exportID.count <= 512,
+                  progress.nextCursor > (previous?.nextCursor ?? 0),
+                  progress.nextCursor < progress.total,
+                  progress.total <= (request.httpBody?.count ?? 0),
+                  previous == nil || (previous?.exportID == progress.exportID && previous?.total == progress.total)
+            else {
+                throw APIExportClientError.serverRejected(statusCode: httpResponse.statusCode, body: preview)
+            }
+            previous = progress
+            let requestedDelay = Double(httpResponse.value(forHTTPHeaderField: "Retry-After") ?? "5") ?? 5
+            let delay = requestedDelay.isFinite ? min(30, max(0, requestedDelay)) : 5
+            if delay > 0 { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
         }
+    }
 
-        return APIExportUploadResult(
-            statusCode: httpResponse.statusCode,
-            responseBodyPreview: responsePreview
-        )
+    private struct MembershipProgress: Decodable {
+        let status: String
+        let exportID: String
+        let nextCursor: Int
+        let total: Int
+        let retrySameOriginal: Bool
+        enum CodingKeys: String, CodingKey {
+            case status, total
+            case exportID = "export_id"
+            case nextCursor = "next_cursor"
+            case retrySameOriginal = "retry_same_original"
+        }
     }
 
     @MainActor
