@@ -5,6 +5,7 @@ import Foundation
 /// with no readable data, and uploads bounded envelopes of complete daily records.
 @MainActor
 struct APIEndpointExportRunner {
+    private static var activeDestinations: Set<String> = []
     typealias HealthDataFetcher = (
         _ date: Date,
         _ includeGranularData: Bool,
@@ -31,6 +32,12 @@ struct APIEndpointExportRunner {
         externalIntegrations: ExternalIntegrationDailyRecordProviding? = nil,
         onProgress: ((_ current: Int, _ total: Int, _ date: Date) -> Void)? = nil
     ) async -> ExportOrchestrator.ExportResult {
+        let outbox: APIExportOutbox
+        do { outbox = try APIExportOutbox() }
+        catch {
+            return failureResult(dates: dates, reason: .fileWriteError,
+                                 message: APIExportOutbox.OutboxError.unavailable.localizedDescription)
+        }
         let externalFetcher: ExternalDailyRecordFetcher?
         if ConnectedAppsFeature.isEnabled,
            let externalIntegrations,
@@ -54,9 +61,16 @@ struct APIEndpointExportRunner {
                 )
             },
             fetchExternalDailyRecords: externalFetcher,
+            // A prepared day enters durable custody before awaiting another
+            // HealthKit query. Keep the existing whole-day and byte bounds.
+            maximumDatesPerBatch: 1,
             onProgress: onProgress,
+            outbox: outbox,
+            resume: { entry, apiSettings in
+                try await APIExportClient().resume(entry, apiSettings: apiSettings, outbox: outbox)
+            },
             upload: { body, apiSettings in
-                try await APIExportClient().uploadPayload(body, apiSettings: apiSettings)
+                try await APIExportClient().uploadDurablePayload(body, apiSettings: apiSettings, outbox: outbox)
             }
         )
     }
@@ -71,6 +85,8 @@ struct APIEndpointExportRunner {
         maximumDatesPerBatch: Int = 32,
         connectedAppsEnabled: Bool? = nil,
         onProgress: ((_ current: Int, _ total: Int, _ date: Date) -> Void)? = nil,
+        outbox: APIExportOutbox? = nil,
+        resume: ((_ entry: APIExportOutbox.Entry, _ apiSettings: APIExportSettings) async throws -> APIExportUploadResult)? = nil,
         upload: Uploader
     ) async -> ExportOrchestrator.ExportResult {
         let normalizedDates = Array(Set(dates.map { Calendar.current.startOfDay(for: $0) })).sorted()
@@ -94,6 +110,29 @@ struct APIEndpointExportRunner {
                 message: APIExportClientError.invalidEndpoint.localizedDescription
             )
         }
+        let binding: String
+        do { binding = try APIExportOutbox.binding(for: APIExportClient.request(body: nil, apiSettings: apiSettings)) }
+        catch { return failureResult(dates: normalizedDates, reason: .fileWriteError,
+                                     message: APIExportClientError.invalidEndpoint.localizedDescription) }
+        guard activeDestinations.insert(binding).inserted else {
+            return failureResult(dates: normalizedDates, reason: .fileWriteError,
+                                 message: APIExportOutbox.OutboxError.busy.localizedDescription)
+        }
+        defer { activeDestinations.remove(binding) }
+        let pending: [APIExportOutbox.Entry]
+        do {
+            pending = try outbox?.pending(for: APIExportClient.request(body: nil, apiSettings: apiSettings)) ?? []
+        } catch {
+            return failureResult(dates: normalizedDates, reason: .fileWriteError,
+                                 message: APIExportOutbox.OutboxError.unavailable.localizedDescription)
+        }
+        let dayFormatter = DateFormatter()
+        dayFormatter.calendar = Calendar(identifier: .gregorian)
+        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dayFormatter.timeZone = TimeZone.current
+        dayFormatter.dateFormat = "yyyy-MM-dd"
+        let requestedDays = Dictionary(uniqueKeysWithValues: normalizedDates.map { (dayFormatter.string(from: $0), $0) })
+        var resumed: Set<String> = []
         precondition(maximumPayloadBytes > 0 && maximumDatesPerBatch > 0)
         let byteLimit = min(maximumPayloadBytes, APIExportClient.maximumPayloadBytes)
         let exportedAt = Date()
@@ -153,6 +192,40 @@ struct APIEndpointExportRunner {
         for (index, date) in normalizedDates.reversed().enumerated() {
             if Task.isCancelled { return result(wasCancelled: true) }
             onProgress?(index + 1, normalizedDates.count, date)
+            let queued = pending.filter { $0.days.contains { $0.date == dayFormatter.string(from: date) } }
+            if !queued.isEmpty {
+                // A scheduled retry or a new manual selection must settle the
+                // frozen observation for this date before querying it again.
+                // Newer, independent dates still reach their ordinary first turn.
+                if !(await flush()) { return result(wasCancelled: true) }
+                for entry in queued where resumed.insert(entry.id).inserted {
+                    do {
+                        guard let resume else { throw APIExportOutbox.OutboxError.recoveryUnavailable }
+                        _ = try await resume(entry, apiSettings)
+                        for day in entry.days where requestedDays[day.date] != nil {
+                            successCount += day.records
+                            uploadedExternalCount += day.externalRecords
+                        }
+                        failedDateDetails.append(contentsOf: zip(entry.failureDates, entry.failures)
+                            .filter { requestedDays[$0.0] != nil }.map { $0.1 })
+                        for day in entry.partialDates {
+                            if let requested = requestedDays[day] {
+                                partialFailures.append(ExportPartialFailure(
+                                    date: requested, dataType: "Queued source capture",
+                                    dateRangeDescription: day,
+                                    errorDescription: "The acknowledged original retains partial source coverage."
+                                ))
+                            }
+                        }
+                    } catch {
+                        if Task.isCancelled || error is CancellationError { return result(wasCancelled: true) }
+                        for day in entry.days {
+                            if let requested = requestedDays[day.date] { recordUploadFailure(requested, error) }
+                        }
+                    }
+                }
+                continue
+            }
             var records: [HealthData] = []
             var dayFailures: [FailedDateDetail] = []
             var externalRecords: [ExternalDailyRecord] = []
@@ -225,6 +298,14 @@ struct APIEndpointExportRunner {
         }
 
         if !(await flush()) { return result(wasCancelled: true) }
+        // Give older prepared exports outside this selection a bounded turn
+        // only after current requested dates have had their live-first turn.
+        if let resume, !Task.isCancelled {
+            for entry in pending.filter({ !resumed.contains($0.id) }).prefix(4) {
+                if Task.isCancelled { break }
+                _ = try? await resume(entry, apiSettings)
+            }
+        }
         return result()
     }
 
@@ -254,4 +335,3 @@ struct APIEndpointExportRunner {
         }
     }
 }
-

@@ -13,6 +13,15 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
             Task { @MainActor in
                 await SchedulingManager.shared.drainPendingExportsIfNeeded(trigger: .appActive)
                 await SchedulingManager.shared.performCatchUpExportIfNeeded()
+                // Reopen only prepared API requests, after fresh scheduled
+                // work. Reuse the existing credential and app-active trigger.
+                if UserDefaults.standard.string(forKey: ExportTargetSelection.storageKey) == ExportTargetSelection.apiEndpoint.rawValue,
+                   PurchaseManager.shared.isUnlocked,
+                   let outbox = try? APIExportOutbox() {
+                    _ = try? await APIExportClient().resumePendingPayloads(
+                        apiSettings: APIExportSettings(), outbox: outbox
+                    )
+                }
                 WidgetCenter.shared.reloadAllTimelines()
             }
         }
