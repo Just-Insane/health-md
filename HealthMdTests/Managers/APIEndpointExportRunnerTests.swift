@@ -65,7 +65,7 @@ final class APIEndpointExportRunnerTests: XCTestCase {
         XCTAssertEqual(uploadedRange?.1, second)
     }
 
-    func testProviderOnlyDayRemainsSupplementalAndDoesNotTriggerUpload() async {
+    func testProviderOnlyDayIsUploadedWithoutInventingHealthData() async {
         let exportDate = date(year: 2026, month: 5, day: 10)
         let settings = AdvancedExportSettings(userDefaults: defaults)
         Self.retainedSettings.append(settings)
@@ -73,6 +73,7 @@ final class APIEndpointExportRunnerTests: XCTestCase {
         apiSettings.endpointURLString = "https://api.example.com/healthmd"
         var externalFetchCount = 0
         var uploadCount = 0
+        var uploadedProviderRecords: [ExternalDailyRecord] = []
 
         let result = await APIEndpointExportRunner.export(
             dates: [exportDate],
@@ -92,7 +93,12 @@ final class APIEndpointExportRunnerTests: XCTestCase {
                     )]
                 )]
             },
-            upload: { _, _, _, _, _, _, _ in
+            upload: { records, failures, externalRecords, _, _, rangeStart, rangeEnd in
+                XCTAssertTrue(records.isEmpty)
+                XCTAssertEqual(failures.map(\.reason), [.noHealthData])
+                XCTAssertEqual(rangeStart, exportDate)
+                XCTAssertEqual(rangeEnd, exportDate)
+                uploadedProviderRecords = externalRecords
                 uploadCount += 1
                 return APIExportUploadResult(statusCode: 202, responseBodyPreview: nil)
             }
@@ -100,8 +106,47 @@ final class APIEndpointExportRunnerTests: XCTestCase {
 
         XCTAssertEqual(result.successCount, 0)
         XCTAssertEqual(result.failedDateDetails.first?.reason, .noHealthData)
-        XCTAssertEqual(externalFetchCount, 0)
-        XCTAssertEqual(uploadCount, 0)
+        XCTAssertEqual(externalFetchCount, 1)
+        XCTAssertEqual(uploadCount, 1)
+        XCTAssertEqual(result.externalRecordFileCount, 1)
+        XCTAssertEqual(uploadedProviderRecords.first?.provider, .whoop)
+        XCTAssertEqual(uploadedProviderRecords.first?.payloads.first?.data, .object(["records": .array([.object(["id": .number(1)])])]))
+
+    }
+
+    func testProviderRecordsSurviveAppleHealthReadFailure() async {
+        let exportDate = date(year: 2026, month: 5, day: 10)
+        let settings = AdvancedExportSettings(userDefaults: defaults)
+        Self.retainedSettings.append(settings)
+        let apiSettings = APIExportSettings(userDefaults: defaults)
+        apiSettings.endpointURLString = "https://api.example.com/healthmd"
+        let sidecar = ExternalDailyRecord(
+            provider: .whoop,
+            date: ExternalProviderAPIClient.dayString(exportDate),
+            payloads: [],
+            warnings: ["Provider returned a durable partial-data warning"]
+        )
+        var uploadCount = 0
+
+        let result = await APIEndpointExportRunner.export(
+            dates: [exportDate],
+            settings: settings,
+            apiSettings: apiSettings,
+            fetchHealthData: { _, _, _ in throw HealthKitManager.HealthKitError.notAuthorized },
+            fetchExternalDailyRecords: { _ in [sidecar] },
+            upload: { records, failures, externalRecords, _, _, _, _ in
+                XCTAssertTrue(records.isEmpty)
+                XCTAssertEqual(failures.map(\.reason), [.healthKitError])
+                XCTAssertEqual(externalRecords, [sidecar])
+                uploadCount += 1
+                return APIExportUploadResult(statusCode: 202, responseBodyPreview: nil)
+            }
+        )
+
+        XCTAssertEqual(uploadCount, 1)
+        XCTAssertEqual(result.successCount, 0)
+        XCTAssertEqual(result.externalRecordFileCount, 1)
+        XCTAssertEqual(result.failedDateDetails.first?.reason, .healthKitError)
     }
 
     func testUploadFailureReturnsFileWriteFailureWithoutCountingPreparedRecordsAsSuccess() async {

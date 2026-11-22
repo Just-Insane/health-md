@@ -130,10 +130,6 @@ struct APIEndpointExportRunner {
 
                 if record.hasAnyData {
                     records.append(record)
-                    if let fetchExternalDailyRecords {
-                        let providerRecords = await fetchExternalDailyRecords(date)
-                        externalRecords.append(contentsOf: providerRecords.filter(\.shouldExport))
-                    }
                 } else {
                     failedDateDetails.append(FailedDateDetail(date: date, reason: .noHealthData))
                 }
@@ -150,9 +146,16 @@ struct APIEndpointExportRunner {
                     errorDetails: error.localizedDescription
                 ))
             }
+
+            // Connected providers have their own authorized records. Keep them
+            // even when Apple Health has no data or cannot read this date.
+            if !Task.isCancelled, let fetchExternalDailyRecords {
+                let providerRecords = await fetchExternalDailyRecords(date)
+                externalRecords.append(contentsOf: providerRecords.filter(\.shouldExport))
+            }
         }
 
-        guard !records.isEmpty else {
+        guard !records.isEmpty || !externalRecords.isEmpty else {
             return ExportOrchestrator.ExportResult(
                 successCount: 0,
                 totalCount: normalizedDates.count,
