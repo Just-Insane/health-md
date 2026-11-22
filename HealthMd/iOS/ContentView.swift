@@ -846,178 +846,72 @@ struct ContentView: View {
             let dates = ExportOrchestrator.dateRange(from: dateRange.startDate, to: dateRange.endDate)
             let normalizedStartDate = dates.first ?? dateRange.startDate
             let normalizedEndDate = dates.last ?? dateRange.endDate
-            let totalDays = dates.count
             let dateFormatter = DateFormatter()
             dateFormatter.dateFormat = "yyyy-MM-dd"
 
-            var records: [HealthData] = []
-            var externalRecords: [ExternalDailyRecord] = []
-            var failedDateDetails: [FailedDateDetail] = []
-            var partialFailures: [ExportPartialFailure] = []
-
-            for (index, date) in dates.enumerated() {
-                if Task.isCancelled {
-                    let result = ExportOrchestrator.ExportResult(
-                        successCount: records.count,
-                        totalCount: totalDays,
-                        failedDateDetails: failedDateDetails,
-                        partialFailures: partialFailures,
-                        formatsPerDate: 0,
-                        externalRecordFileCount: externalRecords.count,
-                        wasCancelled: true
-                    )
-                    ExportOrchestrator.recordResult(
-                        result,
-                        source: .manual,
-                        dateRangeStart: normalizedStartDate,
-                        dateRangeEnd: normalizedEndDate,
-                        targetLabel: "API Endpoint",
-                        fileCount: 0
-                    )
-                    exportStatusMessage = records.isEmpty
-                        ? "API export cancelled"
-                        : "API export stopped — prepared \(records.count)/\(totalDays) days"
-                    vaultManager.lastExportStatus = exportStatusMessage
-                    startStatusDismissTimer()
-                    return
+            let result = await APIEndpointExportRunner.export(
+                dates: dates,
+                healthKitManager: healthKitManager,
+                settings: advancedSettings,
+                apiSettings: apiExportSettings,
+                externalIntegrations: ConnectedAppsFeature.isEnabled ? externalIntegrationManager : nil,
+                onProgress: { current, total, date in
+                    exportStatusMessage = "Exporting \(dateFormatter.string(from: date)) to API… (\(current)/\(total))"
+                    exportProgress = Double(current) / Double(max(total, 1)) * 0.95
                 }
+            )
+            ExportOrchestrator.recordResult(
+                result,
+                source: .manual,
+                dateRangeStart: normalizedStartDate,
+                dateRangeEnd: normalizedEndDate,
+                targetLabel: apiExportSettings.displayName,
+                fileCount: 0
+            )
 
-                exportStatusMessage = "Preparing \(dateFormatter.string(from: date)) for API… (\(index + 1)/\(totalDays))"
-                exportProgress = Double(index + 1) / Double(max(totalDays, 1)) * 0.7
-
-                do {
-                    let record = try await healthKitManager.fetchHealthData(
-                        for: date,
-                        includeGranularData: advancedSettings.includeGranularData,
-                        metricSelection: advancedSettings.metricSelection
-                    ).filtered(by: advancedSettings.metricSelection)
-                    partialFailures.append(contentsOf: record.partialFailures)
-                    if record.hasAnyData {
-                        records.append(record)
-                        if ConnectedAppsFeature.isEnabled, externalIntegrationManager.connectedProviderCount > 0 {
-                            let providerRecords = await externalIntegrationManager.fetchDailyRecords(for: date)
-                            externalRecords.append(contentsOf: providerRecords.filter(\.shouldExport))
-                        }
-                    } else {
-                        failedDateDetails.append(FailedDateDetail(date: date, reason: .noHealthData))
-                    }
-                } catch let error as HealthKitManager.HealthKitError {
-                    failedDateDetails.append(FailedDateDetail(
-                        date: date,
-                        reason: apiExportFailureReason(for: error),
-                        errorDetails: String(describing: error)
-                    ))
-                } catch {
-                    failedDateDetails.append(FailedDateDetail(
-                        date: date,
-                        reason: .healthKitError,
-                        errorDetails: error.localizedDescription
-                    ))
-                }
+            let hasUploadedData = result.successCount > 0 || result.externalRecordFileCount > 0
+            var uploadedParts: [String] = []
+            if result.successCount > 0 {
+                uploadedParts.append("\(result.successCount) day\(result.successCount == 1 ? "" : "s")")
             }
-
-            guard !records.isEmpty else {
-                let result = ExportOrchestrator.ExportResult(
-                    successCount: 0,
-                    totalCount: totalDays,
-                    failedDateDetails: failedDateDetails.isEmpty
-                        ? [FailedDateDetail(date: normalizedStartDate, reason: .noHealthData)]
-                        : failedDateDetails,
-                    partialFailures: partialFailures,
-                    formatsPerDate: 0,
-                    externalRecordFileCount: externalRecords.count
-                )
-                ExportOrchestrator.recordResult(
-                    result,
-                    source: .manual,
-                    dateRangeStart: normalizedStartDate,
-                    dateRangeEnd: normalizedEndDate,
-                    targetLabel: "API Endpoint",
-                    fileCount: 0
-                )
-                exportStatusMessage = "API export failed: No health data"
-                vaultManager.lastExportStatus = "API export failed"
-                errorMessage = ExportFailureReason.noHealthData.detailedDescription
-                showError = true
-                return
+            if result.externalRecordFileCount > 0 {
+                uploadedParts.append("\(result.externalRecordFileCount) provider record\(result.externalRecordFileCount == 1 ? "" : "s")")
             }
+            let uploadedDescription = uploadedParts.joined(separator: " + ")
 
-            do {
-                let providerRecordDescription = externalRecords.isEmpty
-                    ? ""
-                    : " + \(externalRecords.count) provider record\(externalRecords.count == 1 ? "" : "s")"
-                exportStatusMessage = "Uploading \(records.count) day\(records.count == 1 ? "" : "s")\(providerRecordDescription) to API…"
-                exportProgress = 0.85
-                let uploadResult = try await APIExportClient().upload(
-                    records: records,
-                    failedDateDetails: failedDateDetails,
-                    externalRecords: externalRecords,
-                    settings: advancedSettings,
-                    apiSettings: apiExportSettings,
-                    dateRangeStart: normalizedStartDate,
-                    dateRangeEnd: normalizedEndDate
-                )
-
-                let result = ExportOrchestrator.ExportResult(
-                    successCount: records.count,
-                    totalCount: totalDays,
-                    failedDateDetails: failedDateDetails,
-                    partialFailures: partialFailures,
-                    formatsPerDate: 0,
-                    externalRecordFileCount: externalRecords.count
-                )
-                ExportOrchestrator.recordResult(
-                    result,
-                    source: .manual,
-                    dateRangeStart: normalizedStartDate,
-                    dateRangeEnd: normalizedEndDate,
-                    targetLabel: apiExportSettings.displayName,
-                    fileCount: 0
-                )
-
+            if hasUploadedData {
                 purchaseManager.recordExportUse()
                 trackSuccessfulExport(
                     targetType: .apiEndpoint,
                     startDate: normalizedStartDate,
                     endDate: normalizedEndDate
                 )
+            }
 
-                if result.isPartialSuccess {
+            if result.wasCancelled {
+                exportStatusMessage = hasUploadedData
+                    ? "API export stopped — \(uploadedDescription) uploaded"
+                    : "API export cancelled"
+                vaultManager.lastExportStatus = exportStatusMessage
+                startStatusDismissTimer()
+            } else if hasUploadedData {
+                if !result.failedDateDetails.isEmpty || result.hasPartialFailures {
                     partialExportNotice = PartialExportNotice(result: result)
-                    let failedDatesStr = result.failedDateDetails.map { $0.dateString }.joined(separator: ", ")
-                    let suffix = result.hasPartialFailures ? result.partialFailureSummary : "Failed: \(failedDatesStr)"
-                    exportStatusMessage = "Uploaded \(records.count)/\(totalDays) days\(providerRecordDescription) to API. \(suffix)"
-                    vaultManager.lastExportStatus = "API partial export: \(records.count)/\(totalDays) days uploaded"
+                    let failedDates = result.failedDateDetails.map { $0.dateString }.joined(separator: ", ")
+                    let suffix = result.hasPartialFailures ? result.partialFailureSummary : "Failed: \(failedDates)"
+                    exportStatusMessage = "Uploaded \(uploadedDescription) to API. \(suffix)"
+                    vaultManager.lastExportStatus = "API partial export: \(result.successCount)/\(result.totalCount) days uploaded"
                 } else {
-                    exportStatusMessage = "Uploaded \(records.count) day\(records.count == 1 ? "" : "s")\(providerRecordDescription) to API (HTTP \(uploadResult.statusCode))"
+                    exportStatusMessage = "Uploaded \(uploadedDescription) to API"
                     vaultManager.lastExportStatus = "API export complete"
                     startStatusDismissTimer()
                 }
-            } catch {
-                let failedDetail = FailedDateDetail(
-                    date: normalizedStartDate,
-                    reason: .fileWriteError,
-                    errorDetails: error.localizedDescription
-                )
-                let result = ExportOrchestrator.ExportResult(
-                    successCount: 0,
-                    totalCount: totalDays,
-                    failedDateDetails: [failedDetail],
-                    partialFailures: partialFailures,
-                    formatsPerDate: 0,
-                    externalRecordFileCount: externalRecords.count
-                )
-                ExportOrchestrator.recordResult(
-                    result,
-                    source: .manual,
-                    dateRangeStart: normalizedStartDate,
-                    dateRangeEnd: normalizedEndDate,
-                    targetLabel: apiExportSettings.displayName,
-                    fileCount: 0
-                )
-                exportStatusMessage = "API export failed: \(error.localizedDescription)"
-                vaultManager.lastExportStatus = "API export failed"
-                errorMessage = error.localizedDescription
+            } else {
+                let detail = result.failedDateDetails.first?.detailedMessage
+                    ?? ExportFailureReason.noHealthData.detailedDescription
+                exportStatusMessage = "API export failed"
+                vaultManager.lastExportStatus = exportStatusMessage
+                errorMessage = detail
                 showError = true
             }
         }
@@ -2274,3 +2168,4 @@ private struct SettingsRow: View {
         .environmentObject(SchedulingManager.shared)
         .environmentObject(ExternalIntegrationManager())
 }
+

@@ -174,6 +174,10 @@ See [Date, Time, and Units](./date-time-units.md) and [Data Dictionary and Roll-
 
 API Endpoint export wraps ordinary v7 daily records in `healthmd.api_export`. The daily record version is declared by `daily_record_schema_version`; each `records` item still contains its own schema/version and archive. Provider-specific sidecars can independently advance the API envelope version without changing `healthmd.health_data`.
 
+Manual and scheduled API exports use the same bounded sender. Dates are processed newest first, in envelopes of at most 32 dates and 16 MiB of encoded UTF-8 JSON. Each envelope's `date_range`, counts, daily records, provider records, and failed-date details describe that envelope. These are ordinary v1/v2 envelopes; the daily and API schemas are unchanged.
+
+A day and its available provider sidecars stay together. A daily archive is never split, clipped, or reduced to summaries to meet the byte limit. If a single complete day exceeds the limit, that date is reported as unsent and other dates can continue. Success counts include only acknowledged uploads, including after partial failure or cancellation. The receiver's explicit membership continuation resends the identical prepared bytes. This sender does not persist an upload spool across app termination; interrupted requests are not reported as acknowledged.
+
 ## Practical limits
 
 - Health.md can preserve only data exposed by public HealthKit and WorkoutKit APIs on the running OS.
@@ -217,3 +221,4 @@ Bump the daily schema when a public key, type, meaning, unit, aggregation, JSON 
 6. Run exporter contract tests and a mixed v5/v6/v7 export smoke test.
 
 A release smoke test should cover local iPhone, API, and Connected Mac outputs; summary-only and lossless settings; Markdown/Bases readability; canonical JSON/CSV parity; and an updated downstream Obsidian parser.
+

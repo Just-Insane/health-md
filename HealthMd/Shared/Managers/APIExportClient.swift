@@ -9,6 +9,7 @@ enum APIExportClientError: LocalizedError {
     case invalidEndpoint
     case invalidPayload
     case invalidResponse
+    case payloadTooLarge(byteCount: Int, maximumBytes: Int)
     case serverRejected(statusCode: Int, body: String?)
 
     var errorDescription: String? {
@@ -19,6 +20,8 @@ enum APIExportClientError: LocalizedError {
             return "Health.md could not prepare the API export payload."
         case .invalidResponse:
             return "The API endpoint returned an invalid response."
+        case .payloadTooLarge(let byteCount, let maximumBytes):
+            return "A complete daily export is \(byteCount) bytes, exceeding the API limit of \(maximumBytes) bytes. That date was not sent; no records were removed or truncated."
         case .serverRejected(let statusCode, let body):
             if let body, !body.isEmpty {
                 return "API endpoint returned HTTP \(statusCode): \(body)"
@@ -29,6 +32,7 @@ enum APIExportClientError: LocalizedError {
 }
 
 struct APIExportClient {
+    static let maximumPayloadBytes = 16 * 1024 * 1024
     private let session: URLSession
 
     init(session: URLSession = .shared) {
@@ -45,10 +49,6 @@ struct APIExportClient {
         dateRangeStart: Date,
         dateRangeEnd: Date
     ) async throws -> APIExportUploadResult {
-        guard let endpointURL = apiSettings.endpointURL else {
-            throw APIExportClientError.invalidEndpoint
-        }
-
         let body = try Self.makePayload(
             records: records,
             failedDateDetails: failedDateDetails,
@@ -57,6 +57,22 @@ struct APIExportClient {
             dateRangeStart: dateRangeStart,
             dateRangeEnd: dateRangeEnd
         )
+
+        return try await uploadPayload(body, apiSettings: apiSettings)
+    }
+
+    /// Upload already-prepared bytes so membership continuation keeps the
+    /// original export timestamp, day membership and body unchanged.
+    @MainActor
+    func uploadPayload(_ body: Data, apiSettings: APIExportSettings) async throws -> APIExportUploadResult {
+        guard let endpointURL = apiSettings.endpointURL else {
+            throw APIExportClientError.invalidEndpoint
+        }
+        guard body.count <= Self.maximumPayloadBytes else {
+            throw APIExportClientError.payloadTooLarge(
+                byteCount: body.count, maximumBytes: Self.maximumPayloadBytes
+            )
+        }
 
         var request = URLRequest(url: endpointURL)
         request.httpMethod = "POST"
@@ -69,6 +85,55 @@ struct APIExportClient {
         request.httpBody = body
 
         return try await uploadPreparedRequest(request)
+    }
+
+    /// Join whole prepared daily envelopes without re-exporting HealthKit
+    /// records. The public v1/v2 envelope and daily schemas remain unchanged.
+    /// A single input is returned byte-for-byte.
+    static func combinePayloads(_ payloads: [Data]) throws -> Data {
+        guard let first = payloads.first else { throw APIExportClientError.invalidPayload }
+        guard payloads.count > 1 else { return first }
+        guard var envelope = try JSONSerialization.jsonObject(with: first) as? [String: Any],
+              var records = envelope["records"] as? [Any],
+              var failures = envelope["failed_date_details"] as? [Any],
+              let firstRange = envelope["date_range"] as? [String: String],
+              var rangeStart = firstRange["start"],
+              var rangeEnd = firstRange["end"] else {
+            throw APIExportClientError.invalidPayload
+        }
+        var external = envelope["external_records"] as? [Any] ?? []
+        let metadataKeys = [
+            "schema", "schema_version", "daily_record_schema", "daily_record_schema_version",
+            "exported_at", "source", "external_record_schema", "external_record_schema_version"
+        ]
+        for payload in payloads.dropFirst() {
+            guard let next = try JSONSerialization.jsonObject(with: payload) as? [String: Any],
+                  let nextRecords = next["records"] as? [Any],
+                  let nextFailures = next["failed_date_details"] as? [Any],
+                  let nextRange = next["date_range"] as? [String: String],
+                  let nextStart = nextRange["start"], let nextEnd = nextRange["end"],
+                  metadataKeys.allSatisfy({ key in
+                      let left = envelope[key] as? NSObject
+                      let right = next[key] as? NSObject
+                      return left == right
+                  }) else {
+                throw APIExportClientError.invalidPayload
+            }
+            records.append(contentsOf: nextRecords)
+            failures.append(contentsOf: nextFailures)
+            external.append(contentsOf: next["external_records"] as? [Any] ?? [])
+            rangeStart = min(rangeStart, nextStart)
+            rangeEnd = max(rangeEnd, nextEnd)
+        }
+        envelope["records"] = records
+        envelope["record_count"] = records.count
+        envelope["failed_date_details"] = failures
+        envelope["date_range"] = ["start": rangeStart, "end": rangeEnd]
+        if envelope["external_records"] != nil {
+            envelope["external_records"] = external
+            envelope["external_record_count"] = external.count
+        }
+        return try JSONSerialization.data(withJSONObject: envelope, options: [.prettyPrinted, .sortedKeys])
     }
 
     /// A receiver may durably inventory a large export over several requests.
@@ -196,3 +261,4 @@ struct APIExportClient {
         return try JSONSerialization.jsonObject(with: data)
     }
 }
+
